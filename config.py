@@ -123,6 +123,25 @@ class Settings:
     ml_model_path: str = _get("ML_MODEL_PATH", "models/filter.pkl") or "models/filter.pkl"
     ml_min_probability: float = _get_float("ML_MIN_PROBABILITY", 0.55)
 
+    # Backtesting
+    backtest_equity: float = _get_float("BACKTEST_EQUITY", 10_000.0)
+    backtest_bars: int = _get_int("BACKTEST_BARS", 20_000)
+    backtest_spread_pips: float = _get_float("BACKTEST_SPREAD_PIPS", 0.0)
+    backtest_output_csv: str = _get("BACKTEST_OUTPUT_CSV", "backtest_results.csv") or "backtest_results.csv"
+    backtest_symbols: List[str] = field(default_factory=lambda: _get_list("BACKTEST_SYMBOLS", []))
+    backtest_scan_all: bool = _get_bool("BACKTEST_SCAN_ALL", True)
+    backtest_all_symbols: bool = _get_bool("BACKTEST_ALL_SYMBOLS", False)
+    backtest_symbol_filter: str = _get("BACKTEST_SYMBOL_FILTER", "") or ""
+    backtest_symbol_groups: List[str] = field(default_factory=lambda: _get_list("BACKTEST_SYMBOL_GROUPS", []))
+    backtest_min_bars: int = _get_int("BACKTEST_MIN_BARS", 500)
+    # Quality pre-filters applied before fetching any bar data
+    backtest_max_spread_pct: float = _get_float("BACKTEST_MAX_SPREAD_PCT", 0.1)
+    backtest_max_spread_ticks: int = _get_int("BACKTEST_MAX_SPREAD_TICKS", 100)
+    backtest_instrument_types: List[str] = field(
+        default_factory=lambda: _get_list("BACKTEST_INSTRUMENT_TYPES", ["forex", "indices", "metals", "energy"])
+    )
+    backtest_exclude_filter: str = _get("BACKTEST_EXCLUDE_FILTER", "") or ""
+
     def ensure_dirs(self) -> None:
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
         Path(self.journal_csv).parent.mkdir(parents=True, exist_ok=True)
