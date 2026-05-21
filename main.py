@@ -43,6 +43,7 @@ class TradingBot:
         self._last_signal_bar: Dict[str, datetime] = {}
         self._known_tickets: set[int] = set()
         self._last_daily_summary_day: Optional[str] = None
+        self._last_heartbeat: float = 0.0
 
     # ----------------------------------------------------------- #
     # Lifecycle                                                   #
@@ -95,6 +96,7 @@ class TradingBot:
                 self._manage_open_positions()
                 self._maybe_open_new_trades()
                 self._maybe_send_daily_summary()
+                self._maybe_log_heartbeat()
             except Exception as exc:                 # never crash the loop
                 log.exception("Loop error: %s", exc)
                 notify_error(f"Loop error: {exc}")
@@ -104,6 +106,19 @@ class TradingBot:
     # ----------------------------------------------------------- #
     # Trade lifecycle                                             #
     # ----------------------------------------------------------- #
+    def _maybe_log_heartbeat(self) -> None:
+        now = time.time()
+        if now - self._last_heartbeat < 300:   # every 5 minutes
+            return
+        self._last_heartbeat = now
+        open_count = len(self.mt5.positions_for_magic())
+        acct = self.mt5.account()
+        equity = f"{acct.equity:.2f} {acct.currency}" if acct else "?"
+        log.info(
+            "Heartbeat — equity=%s open_positions=%d symbols=%s",
+            equity, open_count, ",".join(settings.symbols),
+        )
+
     def _maybe_open_new_trades(self) -> None:
         all_positions = self.mt5.positions_for_magic()
         for symbol in settings.symbols:
@@ -140,6 +155,17 @@ class TradingBot:
 
         sig = self.strategy.generate_signal(df_ltf, df_htf)
         if sig is None:
+            f = self.strategy._ltf_features(df_ltf)
+            last = f.iloc[-1]
+            log.debug(
+                "[%s] no signal | ADX=%.1f(thr=%.0f) RSI=%.1f ATR=%.5f EMAok=%s",
+                symbol,
+                last.get("adx", float("nan")),
+                settings.adx_threshold,
+                last.get("rsi", float("nan")),
+                last.get("atr", float("nan")),
+                bool(last.get("close", 0) > last.get("ema_trend", 0)),
+            )
             return
 
         # Optional ML filter

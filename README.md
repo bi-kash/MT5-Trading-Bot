@@ -13,13 +13,151 @@ capital-preservation guards.
 ## How it works in one paragraph
 
 The bot waits for **four independent filters to all agree** before opening a
-trade: (1) higher-timeframe trend bias, (2) lower-timeframe EMA stack alignment,
-(3) ADX confirming a real trend (not chop), and (4) RSI crossing back through
-50 — i.e. a *pullback* inside a confirmed trend. When all four line up, it
-sends an order with an ATR-scaled stop loss and take profit. Position size is
-computed so the **dollar risk per trade is constant**, regardless of which
-instrument or volatility regime. Daily-loss / drawdown / cooldown guards halt
-trading when things go wrong.
+trade: (1) regime filter confirming the market is actually trending (ADX + ATR
+percentile), (2) higher-timeframe trend bias, (3) lower-timeframe EMA stack
+alignment, and (4) RSI crossing back through 50 — i.e. a *pullback* inside a
+confirmed trend. When all four line up, it sends an order with an ATR-scaled
+stop loss and take profit. Position size is computed so the **dollar risk per
+trade is constant**, regardless of which instrument or volatility regime.
+Daily-loss / drawdown / cooldown guards halt trading when things go wrong.
+
+---
+
+## The strategy — explained in detail
+
+The strategy lives in [strategy.py](strategy.py). Every bar, four gates are
+checked in order. **All must pass or no trade is placed.**
+
+### Gate 1 — Regime filter: is the market in a tradeable state?
+
+**What is a regime filter?**
+A "regime" is the current market *state* — trending, ranging, or dead quiet.
+The regime filter classifies that state and blocks trades when conditions are
+unfavourable for trend-following. Without it, the strategy fires signals in
+choppy sideways markets and loses steadily.
+
+**The bot already has one — ADX threshold:**
+
+ADX (Average Directional Index) measures *trend strength*, not direction.
+ADX > 25 = clear trend. ADX < 20 = market ranging sideways.
+
+```
+if ADX < ADX_THRESHOLD (default: 22) → no trade
+```
+
+In [strategy.py:106](strategy.py#L106) this has been in place from the start.
+The backtest results confirm it is working: NOKDKK, USDHKD, EURSGD perform
+badly **not because the filter failed**, but because those exotic crosses almost
+never reach ADX 22 in a clean trend — they're structurally choppy.
+
+**New enhancement — ATR percentile co-filter:**
+
+ADX can briefly spike above threshold during micro-trends inside a dead market.
+The ATR percentile filter adds a second check: even if ADX is high, if the
+current ATR is in the bottom 20% of recent ATR values, volatility is too
+compressed to trade profitably.
+
+```
+if ATR < 20th-percentile of last 50 ATR bars → no trade
+(controlled by ATR_REGIME_PERCENTILE and ATR_REGIME_LOOKBACK in .env)
+```
+
+Set `ATR_REGIME_PERCENTILE=0` to disable and use ADX-only (original behaviour).
+
+**Does the regime filter help?**
+Yes — significantly. On instruments where it fires frequently (ranging markets),
+it is the primary reason those symbols show negative expectancy. On instruments
+where it fires rarely (GOLD, DOW, WTI), those same symbols show 1.3–1.5 PF.
+The regime filter is doing exactly what it should: making the strategy *selectively
+aggressive* rather than always-on.
+
+---
+
+### Gate 2 — Higher-timeframe trend bias: which direction?
+
+Checks H4 close vs H4 EMA-200 (configurable via `HIGHER_TIMEFRAME`).
+
+```
+H4 close > H4 EMA-200  →  only look for LONG (buy) signals
+H4 close < H4 EMA-200  →  only look for SHORT (sell) signals
+```
+
+This is the "big picture" filter. Trades in the direction of the dominant
+multi-day trend have higher follow-through probability than counter-trend
+entries. A pullback on M15 that looks like a great long setup is often just
+a dead-cat bounce if H4 says the market has been falling for weeks.
+
+H4 is the default. `HIGHER_TIMEFRAME=D1` gives a more stubborn filter that
+trades less but is cleaner. `H1` reacts faster but produces more whipsaws.
+
+---
+
+### Gate 3 — LTF EMA stack: does the entry timeframe agree?
+
+On the M15 chart, two conditions must both hold for longs:
+
+- `Close > EMA-200` — price is above the long-run trend line
+- `EMA-20 > EMA-50` — short MA above long MA = upward momentum
+
+(Inverted for shorts: `Close < EMA-200` and `EMA-20 < EMA-50`.)
+
+If Gate 2 says "the H4 trend is up" and Gate 3 says "the M15 trend is also
+up", the signal is aligned across two timeframes — that convergence is where
+the highest-probability entries come from.
+
+---
+
+### Gate 4 — RSI pullback trigger: wait for the right entry moment
+
+Even when the trend is confirmed across both timeframes, we do not buy
+immediately. We wait for a **pullback** (a temporary dip inside the uptrend)
+and enter when momentum resumes.
+
+The trigger: RSI(14) crosses **back above 50** after having dipped toward the
+oversold zone. That crossing means: "there was a pullback, and buyers are now
+returning."
+
+```
+RSI(prev) < 50  AND  RSI(now) ≥ 50   →  BUY trigger
+RSI(prev) > 50  AND  RSI(now) ≤ 50   →  SELL trigger
+```
+
+**Why not just buy when the trend looks good?**
+Buying in the middle of a strong trending bar means competing with everyone
+already positioned. A measured pullback gives a better entry price and puts
+the natural swing low close to where your stop belongs. That is where
+institutional desks build positions — not by chasing breakouts.
+
+---
+
+### What happens after a signal fires
+
+| Step | Calculation | Setting |
+|---|---|---|
+| Stop loss | `entry ± SL_ATR_MULT × ATR` | `SL_ATR_MULT=1.5` |
+| Take profit | `entry ± TP_ATR_MULT × ATR` → R:R ≈ 1.67 | `TP_ATR_MULT=2.5` |
+| Position size | `risk_amount ÷ (sl_dist ÷ tick_size × tick_value)` | `RISK_PER_TRADE=0.5%` |
+| Breakeven | SL moves to entry after `BREAKEVEN_AT_R` profit | `BREAKEVEN_AT_R=1.0` |
+| Trailing | SL trails by `TRAILING_ATR_MULT × ATR` from breakeven | `TRAILING_ATR_MULT=1.0` |
+
+Dollar risk is **constant per trade** regardless of which instrument or how
+volatile it currently is. A GOLD trade and an EURUSD trade both risk exactly
+`RISK_PER_TRADE`% of your current equity.
+
+---
+
+### Why does it work on some instruments but not others?
+
+The strategy needs instruments that **trend persistently**. The backtest shows:
+
+- **Works well:** GOLD, WTI, GASS, OILK (commodities with macro supply/demand
+  trends), DOW, VIXM (indices with strong directional phases), EURUSD/GBPUSD
+  (major forex with central-bank driven trends)
+- **Fails:** exotic crosses (NOKDKK, EURSGD, USDHKD) that range most of the
+  time; spread is also too wide to cover the R:R after real entry costs
+
+The multi-symbol backtest is specifically designed to find *which instruments
+your broker's version of this strategy works on* and discard the rest.
 
 ---
 
@@ -111,6 +249,8 @@ fully annotated template. The headline knobs:
 | `SL_ATR_MULT`         | `1.5` | Stop distance in ATR multiples |
 | `TP_ATR_MULT`         | `2.5` | Take-profit in ATR multiples (R:R = 1.67) |
 | `ADX_THRESHOLD`       | `22`  | Below this → no trades (ranging) |
+| `ATR_REGIME_PERCENTILE` | `20` | Skip when ATR < bottom N% of recent bars (0 = off) |
+| `ATR_REGIME_LOOKBACK`   | `50` | Bars used for the ATR percentile window |
 | `MAGIC_NUMBER`        | _unique_ | Bot only manages its own trades |
 
 ---
@@ -301,10 +441,18 @@ for ema_fast in [10, 20, 30]:
 (not in-sample — that's curve-fitting). Saves results to
 `optimization_results.csv`.
 
-### 4. Regime detection
-ADX > 22 is binary. A smoother version uses ATR percentile or realised
-volatility ranks to fade trades during quiet markets and amplify during
-trending markets. Adds 5–10% to typical PF.
+### 4. Regime detection *(partially implemented)*
+ADX > 22 was the original binary gate. The ATR-percentile co-filter
+(`ATR_REGIME_PERCENTILE=20`) is now also active — it skips trades when
+volatility is too compressed even if ADX is technically above threshold.
+
+Next steps to improve further:
+- **Dual ADX hysteresis**: enter only when ADX > 25, exit regime filter only
+  when ADX drops below 18 (prevents whipsawing when ADX hovers at threshold)
+- **Hurst exponent**: measures whether a time series is trending (H > 0.5) or
+  mean-reverting (H < 0.5). More principled than ADX but computationally heavier
+- **Volatility state machine**: classify bars as `trending / volatile / quiet`
+  using a hidden-Markov or regime-switching model on ATR/ADX jointly
 
 ### 5. News-event filter
 The biggest source of "weird" losing trades is high-impact news. Integrate a

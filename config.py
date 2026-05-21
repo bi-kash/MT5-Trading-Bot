@@ -65,6 +65,8 @@ class Settings:
     atr_period: int = _get_int("ATR_PERIOD", 14)
     adx_period: int = _get_int("ADX_PERIOD", 14)
     adx_threshold: float = _get_float("ADX_THRESHOLD", 22.0)
+    atr_regime_percentile: int = _get_int("ATR_REGIME_PERCENTILE", 20)
+    atr_regime_lookback: int = _get_int("ATR_REGIME_LOOKBACK", 50)
     rsi_period: int = _get_int("RSI_PERIOD", 14)
     rsi_overbought: float = _get_float("RSI_OVERBOUGHT", 70.0)
     rsi_oversold: float = _get_float("RSI_OVERSOLD", 30.0)

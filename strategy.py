@@ -102,9 +102,17 @@ class TrendPullbackStrategy:
         if pd.isna(last["atr"]) or pd.isna(last["adx"]) or pd.isna(last["ema_trend"]):
             return None
 
-        # 1) Regime: must be trending
+        # 1) Regime: must be trending (ADX) + sufficient volatility (ATR percentile)
         if last["adx"] < self.s.adx_threshold:
             return None
+
+        if self.s.atr_regime_percentile > 0:
+            lookback = self.s.atr_regime_lookback
+            atr_floor = f["atr"].rolling(lookback).quantile(
+                self.s.atr_regime_percentile / 100.0
+            ).iloc[-1]
+            if not pd.isna(atr_floor) and float(last["atr"]) < atr_floor:
+                return None
 
         # 2) HTF directional bias
         htf_bias = self._htf_bias(df_htf)

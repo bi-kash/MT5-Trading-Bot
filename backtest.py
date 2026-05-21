@@ -483,6 +483,12 @@ def _signal_from_row(f: pd.DataFrame, i: int):
     s = settings
     if last["adx"] < s.adx_threshold:
         return None
+    if s.atr_regime_percentile > 0:
+        lookback = s.atr_regime_lookback
+        start = max(0, i + 1 - lookback)
+        atr_floor = f["atr"].iloc[start : i + 1].quantile(s.atr_regime_percentile / 100.0)
+        if not pd.isna(atr_floor) and float(last["atr"]) < atr_floor:
+            return None
     htf_bias = "buy" if last["htf_close"] > last["htf_ema"] else "sell"
     close = last["close"]
     atr_val = float(last["atr"])
