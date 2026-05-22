@@ -106,13 +106,39 @@ class MT5Connector:
         if tf is None:
             log.error("Unknown timeframe %s", timeframe)
             return None
-        rates = mt5.copy_rates_from_pos(symbol, tf, 0, n_bars)
-        if rates is None or len(rates) == 0:
-            log.warning("No rates for %s %s: %s", symbol, timeframe, mt5.last_error())
+
+        # MT5 caps a single copy_rates_from_pos call at ~100K bars
+        # ("Invalid params" above that). Chunk large requests transparently.
+        import numpy as np
+        CHUNK = 50_000
+        chunks = []
+        pos = 0
+        remaining = n_bars
+        while remaining > 0:
+            take = min(CHUNK, remaining)
+            r = mt5.copy_rates_from_pos(symbol, tf, pos, take)
+            if r is None or len(r) == 0:
+                if pos == 0:
+                    log.warning("No rates for %s %s: %s", symbol, timeframe, mt5.last_error())
+                    return None
+                break   # broker ran out of older history — keep what we got
+            chunks.append(r)
+            pos += len(r)
+            remaining -= len(r)
+            if len(r) < take:
+                break   # broker returned fewer bars than asked — no more history
+
+        if not chunks:
             return None
-        df = pd.DataFrame(rates)
+
+        # Each chunk is chronological (oldest→newest) and chunk N is older than
+        # chunk N-1, so reverse the list to get one chronological array overall.
+        merged = np.concatenate(chunks[::-1])
+        df = pd.DataFrame(merged)
         df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
         df.set_index("time", inplace=True)
+        df = df[~df.index.duplicated(keep="last")]   # belt-and-braces against overlap
+        df.sort_index(inplace=True)
         return df
 
     def symbol_info(self, symbol: str):

@@ -144,6 +144,14 @@ class Settings:
     )
     backtest_exclude_filter: str = _get("BACKTEST_EXCLUDE_FILTER", "") or ""
 
+    # Walk-forward backtest
+    walkforward_periods: int = _get_int("WALKFORWARD_PERIODS", 10)
+    walkforward_bars_per_period: int = _get_int("WALKFORWARD_BARS_PER_PERIOD", 10_000)
+    walkforward_output_dir: str = _get("WALKFORWARD_OUTPUT_DIR", "backtest_results") or "backtest_results"
+    walkforward_summary_csv: str = _get(
+        "WALKFORWARD_SUMMARY_CSV", "backtest_walkforward_summary.csv"
+    ) or "backtest_walkforward_summary.csv"
+
     def ensure_dirs(self) -> None:
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
         Path(self.journal_csv).parent.mkdir(parents=True, exist_ok=True)
