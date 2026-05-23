@@ -83,6 +83,7 @@ class Settings:
 
     sl_atr_mult: float = _get_float("SL_ATR_MULT", 1.5)
     tp_atr_mult: float = _get_float("TP_ATR_MULT", 2.5)
+    min_sl_distance_pct: float = _get_float("MIN_SL_DISTANCE_PCT", 0.3)
     trailing_atr_mult: float = _get_float("TRAILING_ATR_MULT", 1.0)
     use_trailing_stop: bool = _get_bool("USE_TRAILING_STOP", True)
     breakeven_at_r: float = _get_float("BREAKEVEN_AT_R", 1.0)

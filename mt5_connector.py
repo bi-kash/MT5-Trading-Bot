@@ -174,8 +174,7 @@ class MT5Connector:
     # Order execution                                                    #
     # ------------------------------------------------------------------ #
     def _normalize_price(self, symbol_info, price: float) -> float:
-        digits = symbol_info.digits
-        return round(price, digits)
+        return round(float(price), symbol_info.digits)
 
     def send_market_order(
         self,

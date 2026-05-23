@@ -33,6 +33,33 @@ from strategy import Signal, TrendPullbackStrategy
 log = get_logger("main")
 
 
+def _next_trading_open_str() -> str:
+    """Return a human-readable string for when the trading window next opens."""
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    if not settings.trade_on_weekend and now.weekday() >= 5:
+        days_ahead = (7 - now.weekday()) % 7 or 7   # days until Monday
+        open_dt = (now + timedelta(days=days_ahead)).replace(
+            hour=settings.trading_hours_start, minute=0, second=0, microsecond=0
+        )
+        diff = open_dt - now
+        h, m = divmod(int(diff.total_seconds()) // 60, 60)
+        return f"Monday {open_dt.strftime('%H:%M')} UTC (~{h}h {m}m)"
+    if now.hour < settings.trading_hours_start:
+        open_dt = now.replace(
+            hour=settings.trading_hours_start, minute=0, second=0, microsecond=0
+        )
+    else:
+        from datetime import timedelta
+        open_dt = (now + timedelta(days=1)).replace(
+            hour=settings.trading_hours_start, minute=0, second=0, microsecond=0
+        )
+    diff = open_dt - now
+    h, m = divmod(int(diff.total_seconds()) // 60, 60)
+    label = "today" if open_dt.date() == now.date() else "tomorrow"
+    return f"{label} {open_dt.strftime('%H:%M')} UTC (~{h}h {m}m)"
+
+
 class TradingBot:
     def __init__(self) -> None:
         self.mt5 = MT5Connector()
@@ -44,6 +71,7 @@ class TradingBot:
         self._known_tickets: set[int] = set()
         self._last_daily_summary_day: Optional[str] = None
         self._last_heartbeat: float = 0.0
+        self._last_skip_log: Dict[str, float] = {}  # throttle per-symbol status logs
 
     # ----------------------------------------------------------- #
     # Lifecycle                                                   #
@@ -124,19 +152,40 @@ class TradingBot:
         for symbol in settings.symbols:
             self._evaluate_symbol(symbol, all_positions)
 
+    def _throttled_log(self, key: str, interval_minutes: int = 30) -> bool:
+        """Return True and update timestamp if enough time has passed since last log for key."""
+        now = time.time()
+        if now - self._last_skip_log.get(key, 0) >= interval_minutes * 60:
+            self._last_skip_log[key] = now
+            return True
+        return False
+
     def _evaluate_symbol(self, symbol: str, all_positions) -> None:
         sym_positions = [p for p in all_positions if p.symbol == symbol]
         ok, reason = self.risk.can_open_new_trade(
             symbol, len(all_positions), len(sym_positions)
         )
         if not ok:
-            log.debug("[%s] skip: %s", symbol, reason)
+            if "outside trading hours" in reason and self._throttled_log(f"{symbol}_hours"):
+                log.info("[%s] outside trading hours — next open: %s", symbol, _next_trading_open_str())
+            elif "outside trading hours" not in reason:
+                log.debug("[%s] skip: %s", symbol, reason)
             return
 
         # Spread filter
         info = self.mt5.symbol_info(symbol)
         tick = self.mt5.tick(symbol)
         if info is None or tick is None:
+            return
+        if tick.bid <= 0 or tick.ask <= 0:
+            if self._throttled_log(f"{symbol}_quote"):
+                now = datetime.now(timezone.utc)
+                if not settings.trade_on_weekend and now.weekday() >= 5:
+                    log.info("[%s] market closed (weekend) — forex reopens ~%s",
+                             symbol, _next_trading_open_str())
+                else:
+                    log.info("[%s] no live quote from broker (bid=0) — market may be temporarily halted",
+                             symbol)
             return
         spread_points = (tick.ask - tick.bid) / info.point
         if spread_points > settings.max_spread_points:
@@ -154,17 +203,61 @@ class TradingBot:
             return
 
         sig = self.strategy.generate_signal(df_ltf, df_htf)
+        self._last_signal_bar[symbol] = last_bar_time   # mark bar evaluated regardless
         if sig is None:
             f = self.strategy._ltf_features(df_ltf)
-            last = f.iloc[-1]
-            log.debug(
-                "[%s] no signal | ADX=%.1f(thr=%.0f) RSI=%.1f ATR=%.5f EMAok=%s",
-                symbol,
-                last.get("adx", float("nan")),
-                settings.adx_threshold,
-                last.get("rsi", float("nan")),
-                last.get("atr", float("nan")),
-                bool(last.get("close", 0) > last.get("ema_trend", 0)),
+            last, prev = f.iloc[-1], f.iloc[-2]
+            adx_val = float(last.get("adx", float("nan")))
+            rsi_now = float(last.get("rsi", float("nan")))
+            rsi_prev = float(prev.get("rsi", float("nan")))
+            atr_val = float(last.get("atr", float("nan")))
+            close = float(last.get("close", 0))
+            ema_fast = float(last.get("ema_fast", 0))
+            ema_slow = float(last.get("ema_slow", 0))
+            ema_trend_val = float(last.get("ema_trend", 0))
+            htf_bias = self.strategy._htf_bias(df_htf)
+
+            bull_align = htf_bias == "buy" and close > ema_trend_val and ema_fast > ema_slow
+            bear_align = htf_bias == "sell" and close < ema_trend_val and ema_fast < ema_slow
+            crossed_up = rsi_prev < 50 <= rsi_now and rsi_prev > settings.rsi_oversold - 5
+            crossed_dn = rsi_prev > 50 >= rsi_now and rsi_prev < settings.rsi_overbought + 5
+
+            if adx_val < settings.adx_threshold:
+                gate = f"ADX={adx_val:.1f} < {settings.adx_threshold:.0f} (weak trend — needs to strengthen)"
+            elif not (bull_align or bear_align):
+                gate = (
+                    f"no alignment: HTF={htf_bias} EMAfast>slow={ema_fast>ema_slow} "
+                    f"close>EMA200={close>ema_trend_val}"
+                )
+            elif not (crossed_up or crossed_dn):
+                # Give a directional hint so user knows how close the trigger is
+                if bull_align:
+                    if rsi_now < 50:
+                        arrow = "↑" if rsi_now > rsi_prev else "↓"
+                        gap = 50.0 - rsi_now
+                        if rsi_now > rsi_prev:
+                            gate = f"RSI={rsi_now:.1f}{arrow} rising, {gap:.1f}pts from BUY trigger (needs to cross above 50)"
+                        else:
+                            gate = f"RSI={rsi_now:.1f}{arrow} falling (pullback deepening), wait for bottom then cross above 50"
+                    else:
+                        gate = f"RSI={rsi_now:.1f} already above 50 — no fresh cross this bar, wait for dip below 50 first"
+                else:  # bear_align
+                    if rsi_now > 50:
+                        arrow = "↓" if rsi_now < rsi_prev else "↑"
+                        gap = rsi_now - 50.0
+                        if rsi_now < rsi_prev:
+                            gate = f"RSI={rsi_now:.1f}{arrow} falling, {gap:.1f}pts from SELL trigger (needs to cross below 50)"
+                        else:
+                            gate = f"RSI={rsi_now:.1f}{arrow} rising (pullback deepening), wait for top then cross below 50"
+                    else:
+                        gate = f"RSI={rsi_now:.1f} already below 50 — no fresh cross this bar, wait for rally above 50 first"
+            else:
+                gate = f"ATR={atr_val:.5f} below volatility floor (ATR regime filter)"
+
+            log.info(
+                "[%s] bar %s — no signal | %s | ADX=%.1f RSI=%.1f ATR=%.5f HTF=%s",
+                symbol, last_bar_time.strftime("%H:%M"), gate,
+                adx_val, rsi_now, atr_val, htf_bias,
             )
             return
 
@@ -172,7 +265,6 @@ class TradingBot:
         feat_row = self._latest_feature_row(df_ltf)
         if not self.ml.passes(feat_row, sig.side):
             log.info("[%s] ML filter blocked %s signal", symbol, sig.side)
-            self._last_signal_bar[symbol] = last_bar_time
             return
 
         self._open_trade(symbol, sig, last_bar_time)
@@ -187,8 +279,29 @@ class TradingBot:
         if info is None or acct is None:
             return
 
+        # Minimum SL/TP distance = MAX(broker stops_level, MIN_SL_DISTANCE_PCT of entry).
+        # broker tells us its minimum via info.trade_stops_level (in points).
+        broker_min = (info.trade_stops_level or 0) * info.point
+        pct_min    = sig.entry * settings.min_sl_distance_pct / 100.0
+        min_dist   = max(broker_min, pct_min)
+
+        sl, tp = float(sig.sl), float(sig.tp)
+        entry = float(sig.entry)
+        sign = -1 if sig.side == "buy" else 1
+        if abs(entry - sl) < min_dist:
+            sl = round(entry + sign * min_dist, info.digits)
+        if abs(entry - tp) < min_dist:
+            tp = round(entry - sign * min_dist, info.digits)
+        if (sl, tp) != (float(sig.sl), float(sig.tp)):
+            log.info(
+                "[%s] SL/TP widened (broker_min=%.5f pct_min=%.5f used=%.5f): "
+                "SL %.5f->%.5f TP %.5f->%.5f",
+                symbol, broker_min, pct_min, min_dist, sig.sl, sl, sig.tp, tp,
+            )
+
+        # Size from the (possibly widened) SL so dollar risk stays constant
         volume = self.risk.compute_lot_size(
-            info, sig.entry, sig.sl, acct.equity, acct.currency
+            info, entry, sl, acct.equity, acct.currency
         )
         if volume <= 0:
             log.warning("[%s] computed volume <= 0, skipping", symbol)
@@ -196,30 +309,43 @@ class TradingBot:
 
         log.info(
             "[%s] SIGNAL %s vol=%.2f entry=%.5f sl=%.5f tp=%.5f | %s",
-            symbol, sig.side.upper(), volume, sig.entry, sig.sl, sig.tp, sig.reason,
+            symbol, sig.side.upper(), volume, entry, sl, tp, sig.reason,
         )
 
         result = self.mt5.send_market_order(
             symbol=symbol, side=sig.side, volume=volume,
-            sl=sig.sl, tp=sig.tp,
+            sl=sl, tp=tp,
         )
         self._last_signal_bar[symbol] = bar_time
 
         if not result.ok:
-            log.error("[%s] order failed: %s (retcode=%s)", symbol, result.comment, result.retcode)
+            tick = self.mt5.tick(symbol)
+            log.error(
+                "[%s] order failed: %s (retcode=%s) | "
+                "BROKER CONSTRAINTS: stops_level=%s point=%s tick_size=%s digits=%s "
+                "trade_mode=%s vol_min=%s vol_max=%s vol_step=%s "
+                "filling=%s bid=%s ask=%s spread=%s",
+                symbol, result.comment, result.retcode,
+                info.trade_stops_level, info.point, info.trade_tick_size, info.digits,
+                info.trade_mode, info.volume_min, info.volume_max, info.volume_step,
+                info.filling_mode,
+                tick.bid if tick else "?",
+                tick.ask if tick else "?",
+                (tick.ask - tick.bid) if tick else "?",
+            )
             notify_error(f"Order failed {symbol}: {result.comment}")
             journal_record("ORDER_FAIL", symbol, sig.side, volume,
-                           sig.entry, sig.sl, sig.tp, reason=sig.reason, comment=result.comment)
+                           entry, sl, tp, reason=sig.reason, comment=result.comment)
             return
 
         self.risk.register_trade_opened()
         journal_record("OPEN", symbol, sig.side, volume,
-                       result.price or sig.entry, sig.sl, sig.tp,
+                       result.price or entry, sl, tp,
                        ticket=result.ticket, reason=sig.reason)
         if settings.notify_on_open:
             notify(
                 f"<b>{sig.side.upper()} {symbol}</b> {volume} lots\n"
-                f"Entry: {result.price or sig.entry:.5f}\nSL: {sig.sl:.5f}\nTP: {sig.tp:.5f}\n"
+                f"Entry: {result.price or entry:.5f}\nSL: {sl:.5f}\nTP: {tp:.5f}\n"
                 f"Reason: {sig.reason}",
                 level="trade",
             )
