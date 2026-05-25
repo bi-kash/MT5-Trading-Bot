@@ -178,7 +178,22 @@ def load_csv(path: str) -> pd.DataFrame:
     return df
 
 
-def load_mt5(symbol: str, timeframe: str, n_bars: int, connector=None) -> pd.DataFrame:
+def load_mt5(symbol: str, timeframe: str, n_bars: int, connector=None, cache=None) -> pd.DataFrame:
+    """Load OHLCV bars for backtest.
+
+    Routing:
+      - If `cache` is provided (and USE_DATA_CACHE=true), serve from local M1
+        cache with auto-refresh — fast on repeat runs.
+      - Else fall through to direct MT5 fetch via `connector` (or open a
+        temporary connection if no connector is supplied).
+    """
+    if cache is not None and settings.use_data_cache:
+        df = cache.get_rates(symbol, timeframe, n_bars=n_bars)
+        if df is not None and not df.empty:
+            return df
+        log.warning("[%s/%s] cache returned no data — falling back to direct MT5 fetch",
+                    symbol, timeframe)
+
     if connector is not None:
         df = connector.get_rates(symbol, timeframe, n_bars)
         if df is None:
@@ -477,7 +492,15 @@ def run_backtest(
 
 
 def _signal_from_row(f: pd.DataFrame, i: int):
-    """Inline signal logic matching the live strategy."""
+    """Inline signal logic matching the live strategy. Branches on STRATEGY_VARIANT."""
+    variant = (settings.strategy_variant or "rsi_cross").lower()
+    if variant == "swing_breakout":
+        return _signal_swing_breakout(f, i)
+    return _signal_rsi_cross(f, i)
+
+
+def _signal_rsi_cross(f: pd.DataFrame, i: int):
+    """RSI cross through 50 inside a confirmed trend (default)."""
     from strategy import Signal
     last, prev = f.iloc[i], f.iloc[i - 1]
     s = settings
@@ -503,9 +526,53 @@ def _signal_from_row(f: pd.DataFrame, i: int):
     return None
 
 
+def _signal_swing_breakout(f: pd.DataFrame, i: int):
+    """Pullback (RSI dipped <50 within last N bars) + price breakout above last N-bar swing high."""
+    from strategy import Signal
+    s = settings
+    n = max(s.swing_lookback, 2)
+    if i < n + 1:
+        return None
+    last = f.iloc[i]
+    if last["adx"] < s.adx_threshold:
+        return None
+    if s.atr_regime_percentile > 0:
+        lookback = s.atr_regime_lookback
+        start = max(0, i + 1 - lookback)
+        atr_floor = f["atr"].iloc[start : i + 1].quantile(s.atr_regime_percentile / 100.0)
+        if not pd.isna(atr_floor) and float(last["atr"]) < atr_floor:
+            return None
+    htf_bias = "buy" if last["htf_close"] > last["htf_ema"] else "sell"
+    close = last["close"]
+    atr_val = float(last["atr"])
+    bull = htf_bias == "buy"  and close > last["ema_trend"] and last["ema_fast"] > last["ema_slow"]
+    bear = htf_bias == "sell" and close < last["ema_trend"] and last["ema_fast"] < last["ema_slow"]
+
+    # Window = N bars BEFORE current bar
+    window = f.iloc[i - n : i]
+
+    if bull:
+        rsi_dipped = bool((window["rsi"] < 50).any())
+        swing_high = float(window["high"].max())
+        if rsi_dipped and close > swing_high:
+            return Signal("buy",  close,
+                          close - s.sl_atr_mult * atr_val,
+                          close + s.tp_atr_mult * atr_val,
+                          atr_val, "")
+    if bear:
+        rsi_rallied = bool((window["rsi"] > 50).any())
+        swing_low = float(window["low"].min())
+        if rsi_rallied and close < swing_low:
+            return Signal("sell", close,
+                          close + s.sl_atr_mult * atr_val,
+                          close - s.tp_atr_mult * atr_val,
+                          atr_val, "")
+    return None
+
+
 # ── Per-symbol helper ─────────────────────────────────────────────────────── #
 
-def _backtest_symbol(symbol: str, bars: int, equity: float, connector) -> Optional[dict]:
+def _backtest_symbol(symbol: str, bars: int, equity: float, connector, cache=None) -> Optional[dict]:
     """Run backtest for one symbol. Returns summary dict or None on error."""
     inst = _get_instrument(connector, symbol)
     if inst is None:
@@ -514,8 +581,8 @@ def _backtest_symbol(symbol: str, bars: int, equity: float, connector) -> Option
     spread_ticks = _resolve_spread_ticks(inst, settings.backtest_spread_pips)
 
     try:
-        ltf = load_mt5(symbol, settings.timeframe, bars, connector)
-        htf = load_mt5(symbol, settings.higher_timeframe, max(2000, bars // 4), connector)
+        ltf = load_mt5(symbol, settings.timeframe, bars, connector, cache=cache)
+        htf = load_mt5(symbol, settings.higher_timeframe, max(2000, bars // 4), connector, cache=cache)
     except Exception as exc:
         return {"symbol": symbol, "_error": str(exc)}
 
@@ -665,6 +732,12 @@ def main() -> None:
         log.error("Failed to connect to MT5 — check .env credentials")
         sys.exit(1)
 
+    # Local M1 data cache — skips re-downloading bars across repeated runs
+    cache = None
+    if settings.use_data_cache:
+        from data_cache import DataCache
+        cache = DataCache(connector=connector)
+
     try:
         symbols = _resolve_symbol_list(connector, args.symbol)
     except Exception as exc:
@@ -682,6 +755,7 @@ def main() -> None:
     print(f"  Equity  : {equity:,.0f}")
     print(f"  Bars    : {bars}  ({settings.timeframe} + {settings.higher_timeframe})")
     print(f"  Spread  : {'broker live' if settings.backtest_spread_pips <= 0 else f'{settings.backtest_spread_pips} pips'}")
+    print(f"  Cache   : {'on (' + settings.cache_dir + ')' if cache is not None else 'off'}")
     print(f"  Output  : {out_path.resolve()}")
     print(f"  (results written to CSV after EACH symbol — safe to Ctrl+C)\n")
 
@@ -696,7 +770,7 @@ def main() -> None:
         for idx, sym in enumerate(symbols, 1):
             print(f"[{idx:>4}/{len(symbols)}] {sym:<{col_w}}", end="  ", flush=True)
             try:
-                row = _backtest_symbol(sym, bars, equity, connector)
+                row = _backtest_symbol(sym, bars, equity, connector, cache=cache)
             except Exception as exc:
                 row = {"symbol": sym, "_error": f"crashed: {exc}"}
 

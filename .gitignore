@@ -4,5 +4,7 @@ __pycache__/
 *.pyc
 logs/
 models/
+data_cache/
 *.csv
+*.pkl
 .DS_Store

@@ -74,7 +74,7 @@ def split_periods(n_bars: int, n_periods: int, bars_per_period: int,
 
 
 def walkforward_symbol(symbol: str, equity: float, n_periods: int,
-                       bars_per_period: int, connector) -> List[dict]:
+                       bars_per_period: int, connector, cache=None) -> List[dict]:
     """Run walk-forward on one symbol. Returns list of per-period summary dicts."""
     inst = _get_instrument(connector, symbol)
     if inst is None:
@@ -86,8 +86,8 @@ def walkforward_symbol(symbol: str, equity: float, n_periods: int,
     htf_bars = max(2000, total_bars // 4)
 
     try:
-        ltf = load_mt5(symbol, settings.timeframe, total_bars, connector)
-        htf = load_mt5(symbol, settings.higher_timeframe, htf_bars, connector)
+        ltf = load_mt5(symbol, settings.timeframe, total_bars, connector, cache=cache)
+        htf = load_mt5(symbol, settings.higher_timeframe, htf_bars, connector, cache=cache)
     except Exception as exc:
         log.warning("[%s] data fetch failed: %s", symbol, exc)
         return []
@@ -208,6 +208,11 @@ def main() -> None:
         log.error("MT5 connect failed")
         sys.exit(1)
 
+    cache = None
+    if settings.use_data_cache:
+        from data_cache import DataCache
+        cache = DataCache(connector=connector)
+
     try:
         symbols = _resolve_symbol_list(connector, args.symbol)
     except Exception as exc:
@@ -226,6 +231,7 @@ def main() -> None:
           f"({settings.timeframe}) per period")
     print(f"  Total   : ~{n_periods * bars_per_period:,} bars per symbol")
     print(f"  Equity  : {equity:,.0f}")
+    print(f"  Cache   : {'on (' + settings.cache_dir + ')' if cache is not None else 'off'}")
     print(f"  Per-period CSVs: {output_dir.resolve()}")
     print(f"  Summary       : {summary_path.resolve()}\n")
 
@@ -245,7 +251,7 @@ def main() -> None:
             print(f"[{idx:>4}/{len(symbols)}] {sym:<{col_w}}", end="  ", flush=True)
             try:
                 periods = walkforward_symbol(
-                    sym, equity, n_periods, bars_per_period, connector,
+                    sym, equity, n_periods, bars_per_period, connector, cache=cache,
                 )
             except Exception as exc:
                 print(f"CRASH — {exc}")

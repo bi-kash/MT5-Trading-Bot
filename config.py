@@ -59,6 +59,8 @@ class Settings:
     higher_timeframe: str = _get("HIGHER_TIMEFRAME", "H4") or "H4"
 
     # Strategy
+    strategy_variant: str = _get("STRATEGY_VARIANT", "rsi_cross") or "rsi_cross"
+    swing_lookback: int = _get_int("SWING_LOOKBACK", 10)
     ema_fast: int = _get_int("EMA_FAST", 20)
     ema_slow: int = _get_int("EMA_SLOW", 50)
     ema_trend: int = _get_int("EMA_TREND", 200)
@@ -144,6 +146,12 @@ class Settings:
         default_factory=lambda: _get_list("BACKTEST_INSTRUMENT_TYPES", ["forex", "indices", "metals", "energy"])
     )
     backtest_exclude_filter: str = _get("BACKTEST_EXCLUDE_FILTER", "") or ""
+
+    # Historical data cache (used by backtest + walk-forward)
+    use_data_cache: bool = _get_bool("USE_DATA_CACHE", True)
+    cache_dir: str = _get("CACHE_DIR", "data_cache") or "data_cache"
+    cache_stale_days: int = _get_int("CACHE_STALE_DAYS", 10)
+    cache_initial_bars: int = _get_int("CACHE_INITIAL_BARS", 500_000)
 
     # Walk-forward backtest
     walkforward_periods: int = _get_int("WALKFORWARD_PERIODS", 10)

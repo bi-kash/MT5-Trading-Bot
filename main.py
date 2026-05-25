@@ -28,7 +28,7 @@ from ml_filter import MLFilter
 from mt5_connector import MT5Connector
 from notifier import notify, notify_error
 from risk_manager import RiskManager
-from strategy import Signal, TrendPullbackStrategy
+from strategy import Signal, make_strategy
 
 log = get_logger("main")
 
@@ -63,7 +63,7 @@ def _next_trading_open_str() -> str:
 class TradingBot:
     def __init__(self) -> None:
         self.mt5 = MT5Connector()
-        self.strategy = TrendPullbackStrategy()
+        self.strategy = make_strategy()
         self.risk = RiskManager()
         self.ml = MLFilter()
         self._running = True
@@ -167,7 +167,13 @@ class TradingBot:
         )
         if not ok:
             if "outside trading hours" in reason and self._throttled_log(f"{symbol}_hours"):
-                log.info("[%s] outside trading hours — next open: %s", symbol, _next_trading_open_str())
+                log.info(
+                    "[%s] bot configured to skip trades at this hour "
+                    "(TRADING_HOURS_START=%d TRADING_HOURS_END=%d in .env) — "
+                    "next configured window: %s | Note: MT5 broker may still be open",
+                    symbol, settings.trading_hours_start, settings.trading_hours_end,
+                    _next_trading_open_str(),
+                )
             elif "outside trading hours" not in reason:
                 log.debug("[%s] skip: %s", symbol, reason)
             return
@@ -175,21 +181,48 @@ class TradingBot:
         # Spread filter
         info = self.mt5.symbol_info(symbol)
         tick = self.mt5.tick(symbol)
-        if info is None or tick is None:
+        if info is None:
+            if self._throttled_log(f"{symbol}_info"):
+                log.info("[%s] symbol_info returned None — symbol not found or not subscribed in MT5 "
+                         "(check the exact name shown in Market Watch)", symbol)
             return
+        if tick is None:
+            if self._throttled_log(f"{symbol}_tick"):
+                log.info("[%s] no tick data from MT5 — symbol may be offline or delisted", symbol)
+            return
+
+        # Check broker's actual trade availability from MT5 (not a clock guess)
+        _TRADE_MODE_NAMES = {0: "DISABLED", 1: "LONGONLY", 2: "SHORTONLY", 3: "CLOSEONLY", 4: "FULL"}
+        tradeable_modes = (
+            mt5.SYMBOL_TRADE_MODE_FULL,
+            mt5.SYMBOL_TRADE_MODE_LONGONLY,
+            mt5.SYMBOL_TRADE_MODE_SHORTONLY,
+        )
+        if info.trade_mode not in tradeable_modes:
+            if self._throttled_log(f"{symbol}_mode"):
+                mode_name = _TRADE_MODE_NAMES.get(info.trade_mode, str(info.trade_mode))
+                log.info("[%s] MT5 reports trade_mode=%s — broker not accepting new positions",
+                         symbol, mode_name)
+            return
+
         if tick.bid <= 0 or tick.ask <= 0:
             if self._throttled_log(f"{symbol}_quote"):
                 now = datetime.now(timezone.utc)
                 if not settings.trade_on_weekend and now.weekday() >= 5:
-                    log.info("[%s] market closed (weekend) — forex reopens ~%s",
+                    log.info("[%s] MT5 has no live quote — weekend, market reopens ~%s",
                              symbol, _next_trading_open_str())
                 else:
-                    log.info("[%s] no live quote from broker (bid=0) — market may be temporarily halted",
+                    log.info("[%s] MT5 has no live quote (bid=0) — broker temporarily not quoting",
                              symbol)
             return
         spread_points = (tick.ask - tick.bid) / info.point
         if spread_points > settings.max_spread_points:
-            log.debug("[%s] spread %.1f > max %d", symbol, spread_points, settings.max_spread_points)
+            if self._throttled_log(f"{symbol}_spread"):
+                log.info(
+                    "[%s] spread %.1f pts > MAX_SPREAD_POINTS=%d — skipping "
+                    "(indices/CFDs have wider spreads than forex; raise MAX_SPREAD_POINTS in .env if intended)",
+                    symbol, spread_points, settings.max_spread_points,
+                )
             return
 
         df_ltf = self.mt5.get_rates(symbol, settings.timeframe, n_bars=500)
@@ -205,59 +238,10 @@ class TradingBot:
         sig = self.strategy.generate_signal(df_ltf, df_htf)
         self._last_signal_bar[symbol] = last_bar_time   # mark bar evaluated regardless
         if sig is None:
-            f = self.strategy._ltf_features(df_ltf)
-            last, prev = f.iloc[-1], f.iloc[-2]
-            adx_val = float(last.get("adx", float("nan")))
-            rsi_now = float(last.get("rsi", float("nan")))
-            rsi_prev = float(prev.get("rsi", float("nan")))
-            atr_val = float(last.get("atr", float("nan")))
-            close = float(last.get("close", 0))
-            ema_fast = float(last.get("ema_fast", 0))
-            ema_slow = float(last.get("ema_slow", 0))
-            ema_trend_val = float(last.get("ema_trend", 0))
-            htf_bias = self.strategy._htf_bias(df_htf)
-
-            bull_align = htf_bias == "buy" and close > ema_trend_val and ema_fast > ema_slow
-            bear_align = htf_bias == "sell" and close < ema_trend_val and ema_fast < ema_slow
-            crossed_up = rsi_prev < 50 <= rsi_now and rsi_prev > settings.rsi_oversold - 5
-            crossed_dn = rsi_prev > 50 >= rsi_now and rsi_prev < settings.rsi_overbought + 5
-
-            if adx_val < settings.adx_threshold:
-                gate = f"ADX={adx_val:.1f} < {settings.adx_threshold:.0f} (weak trend — needs to strengthen)"
-            elif not (bull_align or bear_align):
-                gate = (
-                    f"no alignment: HTF={htf_bias} EMAfast>slow={ema_fast>ema_slow} "
-                    f"close>EMA200={close>ema_trend_val}"
-                )
-            elif not (crossed_up or crossed_dn):
-                # Give a directional hint so user knows how close the trigger is
-                if bull_align:
-                    if rsi_now < 50:
-                        arrow = "↑" if rsi_now > rsi_prev else "↓"
-                        gap = 50.0 - rsi_now
-                        if rsi_now > rsi_prev:
-                            gate = f"RSI={rsi_now:.1f}{arrow} rising, {gap:.1f}pts from BUY trigger (needs to cross above 50)"
-                        else:
-                            gate = f"RSI={rsi_now:.1f}{arrow} falling (pullback deepening), wait for bottom then cross above 50"
-                    else:
-                        gate = f"RSI={rsi_now:.1f} already above 50 — no fresh cross this bar, wait for dip below 50 first"
-                else:  # bear_align
-                    if rsi_now > 50:
-                        arrow = "↓" if rsi_now < rsi_prev else "↑"
-                        gap = rsi_now - 50.0
-                        if rsi_now < rsi_prev:
-                            gate = f"RSI={rsi_now:.1f}{arrow} falling, {gap:.1f}pts from SELL trigger (needs to cross below 50)"
-                        else:
-                            gate = f"RSI={rsi_now:.1f}{arrow} rising (pullback deepening), wait for top then cross below 50"
-                    else:
-                        gate = f"RSI={rsi_now:.1f} already below 50 — no fresh cross this bar, wait for rally above 50 first"
-            else:
-                gate = f"ATR={atr_val:.5f} below volatility floor (ATR regime filter)"
-
+            gate = self.strategy.diagnose(df_ltf, df_htf)
             log.info(
-                "[%s] bar %s — no signal | %s | ADX=%.1f RSI=%.1f ATR=%.5f HTF=%s",
-                symbol, last_bar_time.strftime("%H:%M"), gate,
-                adx_val, rsi_now, atr_val, htf_bias,
+                "[%s] bar %s — no signal [%s] | %s",
+                symbol, last_bar_time.strftime("%H:%M"), self.strategy.name, gate,
             )
             return
 
