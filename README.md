@@ -1,8 +1,8 @@
 # MT5 Trading Bot (Python)
 
-A disciplined algorithmic trading bot for **MetaTrader 5**. Built around a
-multi-filter trend-pullback strategy, ATR-scaled risk, and aggressive
-capital-preservation guards.
+A disciplined algorithmic trading bot for **MetaTrader 5**. Two interchangeable
+strategy variants, ATR-scaled risk, walk-forward backtesting, Bayesian parameter
+optimization, and aggressive capital-preservation guards.
 
 > **No guarantees of profit.** Markets are adversarial. This bot is built for
 > *survivability* — a small positive edge compounded over many trades, not
@@ -15,11 +15,14 @@ capital-preservation guards.
 The bot waits for **four independent filters to all agree** before opening a
 trade: (1) regime filter confirming the market is actually trending (ADX + ATR
 percentile), (2) higher-timeframe trend bias, (3) lower-timeframe EMA stack
-alignment, and (4) RSI crossing back through 50 — i.e. a *pullback* inside a
-confirmed trend. When all four line up, it sends an order with an ATR-scaled
-stop loss and take profit. Position size is computed so the **dollar risk per
-trade is constant**, regardless of which instrument or volatility regime.
-Daily-loss / drawdown / cooldown guards halt trading when things go wrong.
+alignment, and (4) a strategy-specific entry trigger. Two strategies are
+available — **RSI Cross** (wait for RSI to cross back through 50 after a
+pullback) and **Swing Breakout** (wait for price to break the last N-bar swing
+high/low after an RSI pullback). When all four filters agree, an order is placed
+with an ATR-scaled stop loss and take profit. Position size is computed so the
+**dollar risk per trade is constant**, regardless of which instrument or
+volatility regime. Daily-loss / drawdown / cooldown guards halt trading when
+things go wrong.
 
 ---
 
@@ -137,12 +140,87 @@ institutional desks build positions — not by chasing breakouts.
 | Stop loss | `entry ± SL_ATR_MULT × ATR` | `SL_ATR_MULT=1.5` |
 | Take profit | `entry ± TP_ATR_MULT × ATR` → R:R ≈ 1.67 | `TP_ATR_MULT=2.5` |
 | Position size | `risk_amount ÷ (sl_dist ÷ tick_size × tick_value)` | `RISK_PER_TRADE=0.5%` |
-| Breakeven | SL moves to entry after `BREAKEVEN_AT_R` profit | `BREAKEVEN_AT_R=1.0` |
-| Trailing | SL trails by `TRAILING_ATR_MULT × ATR` from breakeven | `TRAILING_ATR_MULT=1.0` |
+| Breakeven | SL moves to entry after `BREAKEVEN_AT_R` profit | `BREAKEVEN_AT_R=1.5` |
+| Trailing | SL trails by `TRAILING_ATR_MULT × ATR` from breakeven | `TRAILING_ATR_MULT=1.8` |
 
 Dollar risk is **constant per trade** regardless of which instrument or how
 volatile it currently is. A GOLD trade and an EURUSD trade both risk exactly
 `RISK_PER_TRADE`% of your current equity.
+
+---
+
+## Choosing a strategy (`STRATEGY_VARIANT`)
+
+Two signal-generation strategies are available. Switch between them in `.env`:
+
+```ini
+STRATEGY_VARIANT=rsi_cross       # default
+STRATEGY_VARIANT=swing_breakout  # alternative
+```
+
+Both strategies share the same Gates 1–3 (regime filter, HTF bias, EMA stack).
+They differ only in Gate 4 — how the entry trigger is defined.
+
+---
+
+### Strategy 1: `rsi_cross` (default)
+
+**Trigger:** RSI(14) crosses back through 50 after a pullback.
+
+```
+RSI(prev) < 50  AND  RSI(now) ≥ 50   →  BUY
+RSI(prev) > 50  AND  RSI(now) ≤ 50   →  SELL
+```
+
+**When it works best:** Markets that pull back cleanly and resume trend.
+RSI dips below 50, buyers return, RSI crosses back up — textbook pullback
+entry.
+
+**Limitation:** In very strong trends, RSI never dips back below 50. The bot
+sits on the sideline watching the move without entering. Misses "runaway
+trend" phases.
+
+---
+
+### Strategy 2: `swing_breakout`
+
+**Trigger:** Price breaks the highest high (or lowest low) of the last N bars
+**after** RSI has dipped below 50 at some point in that window.
+
+```
+BUY  (bull alignment): RSI dipped below 50 within last N bars
+                       AND close > highest high of those N bars
+
+SELL (bear alignment): RSI rallied above 50 within last N bars
+                       AND close < lowest low of those N bars
+```
+
+Controlled by `SWING_LOOKBACK=10` in `.env` — the lookback window (bars).
+
+**When it works best:** Strong trends where RSI barely dips — the price
+breakout above the swing high is the confirmation. More suitable for
+momentum-driven instruments (indices, commodities).
+
+**Limitation:** Can enter near the end of a move when price is already
+extended. The swing-high breakout entry is typically higher than the RSI-cross
+entry in the same trend.
+
+**Comparison:**
+
+| | `rsi_cross` | `swing_breakout` |
+|---|---|---|
+| Entry type | Pullback entry | Breakout entry |
+| Entry price | Lower (after dip) | Higher (at breakout) |
+| Catches runaway trends | No — requires RSI dip | Yes — only needs a brief dip |
+| Best for | Forex, ranging trends | Indices, strong trends |
+| Setting | `STRATEGY_VARIANT=rsi_cross` | `STRATEGY_VARIANT=swing_breakout` |
+
+**How to choose:** Run `python backtest_walkforward.py` with each variant
+and compare the `stability_score` and `consistency_pct` for your symbols.
+Use whichever scores higher for the instruments you trade.
+
+> When you change strategy variant, **re-run `python optimize.py`** —
+> the optimal parameters differ between strategies.
 
 ---
 
@@ -165,24 +243,40 @@ your broker's version of this strategy works on* and discard the rest.
 
 ```
 .
-├── main.py               # Live runtime loop
-├── strategy.py           # TrendPullback signal generation
-├── risk_manager.py       # Sizing, daily-loss, drawdown, cooldown
-├── mt5_connector.py      # MetaTrader 5 SDK wrapper
-├── indicators.py         # EMA / ATR / ADX / RSI / BBands (pandas)
-├── notifier.py           # Telegram + Discord alerts
-├── journal.py            # CSV trade log
-├── logger.py             # Rotating file + stdout
-├── config.py             # .env -> typed Settings
-├── backtest.py           # Multi-symbol bar-by-bar simulator (single window)
-├── backtest_walkforward.py  # Same backtest run across N time periods + stability metrics
-├── allocate.py           # Pick & weight live symbols from backtest results (auto-detects schema)
-├── ml_filter.py          # Optional probabilistic filter
-├── backtest_results.csv  # Generated by backtest.py — single-window ranked results
-├── backtest_results/     # Per-period CSVs from walkforward (period_01_of_10.csv …)
-├── backtest_walkforward_summary.csv  # Per-symbol stability metrics across all periods
-├── .env                  # Your credentials & settings (gitignored)
-├── .env.example          # Template
+├── main.py                       # Live runtime loop
+├── strategy.py                   # RSICross + SwingBreakout signal generation
+├── risk_manager.py               # Sizing, daily-loss, drawdown, cooldown
+├── mt5_connector.py              # MetaTrader 5 SDK wrapper
+├── indicators.py                 # EMA / ATR / ADX / RSI / BBands (pandas)
+├── notifier.py                   # Telegram + Discord alerts
+├── journal.py                    # CSV trade log
+├── logger.py                     # Rotating file + stdout
+├── config.py                     # .env -> typed Settings (+ loads optimized_params.json)
+├── backtest.py                   # Multi-symbol bar-by-bar simulator (single window)
+├── backtest_walkforward.py       # Backtest across N time periods + stability metrics
+├── data_cache.py                 # Persistent M1 bar cache with incremental refresh
+├── optimize.py                   # Bayesian parameter optimization (Optuna)
+├── allocate.py                   # Pick & weight live symbols from backtest results
+├── ml_filter.py                  # Optional probabilistic filter (skeleton)
+│
+├── optimized_params.json         # Generated by optimize.py (gitignored)
+├── backtest_results.csv          # Generated by backtest.py
+├── backtest_results/             # Per-period CSVs from walkforward
+├── backtest_walkforward_summary.csv
+├── data_cache/                   # Cached M1 .pkl files (gitignored)
+│   ├── EURUSD_M1.pkl
+│   ├── EURUSD_M1_info.txt        # Human-readable cache stats
+│   └── ...
+│
+├── docs/                         # Detailed command documentation
+│   ├── cmd-backtest.md
+│   ├── cmd-walkforward.md
+│   ├── cmd-data-cache.md
+│   ├── cmd-optimize.md
+│   └── cmd-allocate.md
+│
+├── .env                          # Credentials & settings (gitignored)
+├── .env.example                  # Annotated template
 └── requirements.txt
 ```
 
@@ -201,18 +295,34 @@ cp .env.example .env
 Then the typical workflow:
 
 ```bash
-# 1a. Quick scan to see which instruments your strategy works on
+# ── Step 0: Download history (one-time, fast on repeat runs) ──────────── #
+python data_cache.py --download-live
+# Saves ~1 year of M1 bars per symbol to data_cache/ (~40 MB each)
+# Subsequent runs only fetch the gap — takes seconds.
+
+# ── Step 1: Choose a strategy ─────────────────────────────────────────── #
+# Edit .env:
+#   STRATEGY_VARIANT=rsi_cross       (default — RSI crosses 50 after pullback)
+#   STRATEGY_VARIANT=swing_breakout  (price breaks swing high after RSI dip)
+
+# ── Step 2: Find which symbols work ───────────────────────────────────── #
+# Quick single-window scan:
 python backtest.py
 
-# 1b. (Recommended) Walk-forward across 10 time periods for stability ranking
+# (Recommended) Walk-forward — stability across 10 time windows:
 python backtest_walkforward.py
 
-# 2. Pick a weighted symbol list (auto-detects which CSV you point it at)
+# ── Step 3: Optimize parameters ───────────────────────────────────────── #
+pip install optuna           # one-time
+python optimize.py           # ~20-40 min, 300 trials
+# Then in .env: USE_OPTIMIZED_PARAMS=true
+
+# ── Step 4: Pick best symbols ─────────────────────────────────────────── #
 python allocate.py --csv backtest_walkforward_summary.csv --min-consistency 70
+# Paste the SYMBOLS=... line into .env
 
-# 3. Paste the SYMBOLS=... line from allocate.py into .env
-
-# 4. Run live (always start with DRY_RUN=true)
+# ── Step 5: Run live ──────────────────────────────────────────────────── #
+# Start with DRY_RUN=true for at least 1 week before going live
 python main.py
 ```
 
@@ -307,18 +417,44 @@ volatile the instrument is or how wide the SL is.
 All settings live in [`.env`](.env). See [`.env.example`](.env.example) for the
 fully annotated template. The headline knobs:
 
+**Strategy**
+
 | Key | Default | What it does |
 |---|---|---|
-| `DRY_RUN`             | `true` | Logs decisions, sends no real orders |
-| `RISK_PER_TRADE`      | `0.5` | % of equity risked per trade |
-| `MAX_DAILY_LOSS_PCT`  | `3.0` | Daily kill-switch threshold |
-| `MAX_DRAWDOWN_PCT`    | `10.0`| Peak-to-trough kill-switch |
-| `SL_ATR_MULT`         | `1.5` | Stop distance in ATR multiples |
-| `TP_ATR_MULT`         | `2.5` | Take-profit in ATR multiples (R:R = 1.67) |
-| `ADX_THRESHOLD`       | `22`  | Below this → no trades (ranging) |
+| `STRATEGY_VARIANT` | `rsi_cross` | `rsi_cross` or `swing_breakout` — see [Choosing a strategy](#choosing-a-strategy-strategy_variant) |
+| `SWING_LOOKBACK` | `10` | Lookback bars for SwingBreakout strategy |
+| `ADX_THRESHOLD` | `19` | Below this → no trades (ranging market) |
 | `ATR_REGIME_PERCENTILE` | `20` | Skip when ATR < bottom N% of recent bars (0 = off) |
-| `ATR_REGIME_LOOKBACK`   | `50` | Bars used for the ATR percentile window |
-| `MAGIC_NUMBER`        | _unique_ | Bot only manages its own trades |
+
+**Risk**
+
+| Key | Default | What it does |
+|---|---|---|
+| `DRY_RUN` | `false` | `true` = log decisions only, no real orders |
+| `RISK_PER_TRADE` | `0.5` | % of equity risked per trade |
+| `MAX_DAILY_LOSS_PCT` | `3.0` | Daily kill-switch threshold |
+| `MAX_DRAWDOWN_PCT` | `10.0` | Peak-to-trough kill-switch |
+| `SL_ATR_MULT` | `1.5` | Stop distance in ATR multiples |
+| `TP_ATR_MULT` | `2.5` | Take-profit in ATR multiples |
+| `BREAKEVEN_AT_R` | `1.5` | Move SL to breakeven after N×R profit |
+| `TRAILING_ATR_MULT` | `1.8` | ATR trailing stop distance |
+| `MAGIC_NUMBER` | unique | Bot only manages its own trades |
+
+**Data cache**
+
+| Key | Default | What it does |
+|---|---|---|
+| `USE_DATA_CACHE` | `true` | Use local M1 cache; `false` = always fetch fresh |
+| `CACHE_DIR` | `data_cache` | Directory for `.pkl` cache files |
+| `CACHE_STALE_DAYS` | `10` | Auto-refresh when last bar is older than N days |
+| `CACHE_INITIAL_BARS` | `1000000` | Max M1 bars on first download (~1 year) |
+
+**Parameter optimization**
+
+| Key | Default | What it does |
+|---|---|---|
+| `USE_OPTIMIZED_PARAMS` | `false` | `true` = load params from `optimized_params.json` |
+| `OPTIMIZED_PARAMS_FILE` | `optimized_params.json` | Path to the optimization output file |
 
 ---
 
@@ -431,6 +567,41 @@ by losing slowly here, not catastrophically.
 
 ---
 
+## Historical data cache (`data_cache.py`)
+
+Repeated backtesting (single window, walk-forward, parameter sweeps) normally
+re-downloads the same bars from MT5 every time. On large symbol sets this adds
+minutes of wait time per run. The data cache solves this.
+
+**How it works:** bars are stored locally as per-symbol M1 `.pkl` files.
+Higher timeframes (M5, M15, H1, H4, D1) are aggregated on demand from the M1
+base. On the first download, up to `CACHE_INITIAL_BARS` (default 1,000,000 ≈ 1
+year) of M1 data are fetched. On every subsequent run, only the gap from the
+last cached bar to now is fetched — typically a few hundred bars, done in
+seconds.
+
+A plain-text `*_info.txt` file is written alongside each `.pkl` showing what
+it actually contains: date range, bar count, calendar days covered, file size,
+and freshness status.
+
+```bash
+# One-time setup — download all live symbols
+python data_cache.py --download-live
+
+# Check what's cached
+python data_cache.py --info
+
+# Refresh a single symbol
+python data_cache.py --symbol EURUSD
+
+# Force re-download from scratch
+python data_cache.py --download-live --force
+```
+
+→ See [docs/cmd-data-cache.md](docs/cmd-data-cache.md) for full documentation.
+
+---
+
 ## Walk-forward backtest (`backtest_walkforward.py`)
 
 A single backtest gives one performance number per symbol over one window.
@@ -536,6 +707,43 @@ python allocate.py --top 5 --min-pf 1.3 --min-trades 100 --max-dd 10
 > stronger-weighted symbols deserve more attention. A future enhancement is
 > per-symbol risk scaling — open if you want it.
 
+→ See [docs/cmd-allocate.md](docs/cmd-allocate.md) for all flags and filtering options.
+
+---
+
+## Parameter optimization (`optimize.py`)
+
+The default parameters (`EMA_FAST=20`, `ADX_THRESHOLD=19`, `SL_ATR_MULT=1.5`,
+etc.) are reasonable starting points — not optimal for any specific instrument
+set. `optimize.py` finds better values automatically using **Optuna Bayesian
+search** with walk-forward validation to guard against curve-fitting.
+
+**Requires:** `pip install optuna`
+
+```bash
+# Full optimization — all live SYMBOLS, 300 trials (~20-40 min)
+python optimize.py
+
+# Then activate in .env:
+USE_OPTIMIZED_PARAMS=true
+```
+
+**How it avoids overfitting:**
+- Each trial is scored on a mini walk-forward (4 sub-periods), not a single window
+- History is split 70% train / 30% held-out test
+- Best params are validated on the test slice before saving
+- A "Test/Train ratio" is reported: < 75% = warning, < 50% = likely overfitting
+
+**What is optimized:** 8 high-impact parameters (`ema_fast`, `ema_slow`,
+`adx_threshold`, `sl_atr_mult`, `tp_atr_mult`, `atr_regime_percentile`,
+`trailing_atr_mult`, `breakeven_at_r`). The rest stay at `.env` defaults.
+
+**Important:** Re-run after changing `STRATEGY_VARIANT` or your symbol list.
+The optimal parameters differ significantly between `rsi_cross` and
+`swing_breakout`.
+
+→ See [docs/cmd-optimize.md](docs/cmd-optimize.md) for all flags, output format, and caveats.
+
 ---
 
 ## How to improve the algorithm
@@ -547,8 +755,6 @@ The `backtest_walkforward.py` script splits history into N independent
 periods and produces stability metrics per symbol. Use the
 `consistency_pct` column to find symbols whose edge holds across time, not
 just one lucky window. Next-level enhancements:
-* True out-of-sample optimization (tune parameters on periods 1–7, test on
-  periods 8–10 — never reuse a period for both)
 * Rolling-window walk-forward (re-train every N bars rather than fixed splits)
 * Per-period parameter optimization (find the best `ADX_THRESHOLD` per window
   and see if the "best" value is stable or wildly different each time)
@@ -564,18 +770,12 @@ across forex, metals, indices, oil**. Each behaves differently:
 Implementation: add `BACKTEST_PARAMS_PROFILE` switch in `.env` or symbol-group
 overrides.
 
-### 3. Parameter grid search (per symbol)
-Add a `python optimize.py` script that iterates:
-```python
-for ema_fast in [10, 20, 30]:
-    for ema_trend in [100, 200, 300]:
-        for sl_mult in [1.0, 1.5, 2.0]:
-            for tp_mult in [2.0, 2.5, 3.0]:
-                run_backtest(...)
-```
-…then picks the parameter combo with the best **out-of-sample** PF
-(not in-sample — that's curve-fitting). Saves results to
-`optimization_results.csv`.
+### 3. Parameter optimization *(implemented)*
+`python optimize.py` uses Optuna Bayesian search (300 trials) to find the
+best combination of 8 high-impact parameters. Scored using walk-forward
+stability, validated on a held-out test slice. Results saved to
+`optimized_params.json` and activated with `USE_OPTIMIZED_PARAMS=true`.
+See [docs/cmd-optimize.md](docs/cmd-optimize.md).
 
 ### 4. Regime detection *(partially implemented)*
 ADX > 22 was the original binary gate. The ATR-percentile co-filter
@@ -657,17 +857,20 @@ The5%ers, etc.), but **read your firm's rule sheet first**:
 
 ## Safety checklist before going live
 
-- [ ] Backtested on each target symbol — passes PF ≥ 1.2 with ≥ 50 trades
-- [ ] Picked symbols via `allocate.py` (not gut feel)
-- [ ] Walk-forward checked on at least one out-of-sample window
-- [ ] `DRY_RUN=false` only after ≥ 2 weeks of clean demo performance
-- [ ] `MAX_DAILY_LOSS_PCT` and `MAX_DRAWDOWN_PCT` set conservatively
+- [ ] History cached — `python data_cache.py --download-live` completed
+- [ ] Walk-forward run — `consistency_pct ≥ 70` on target symbols
+- [ ] Symbols picked via `allocate.py --csv backtest_walkforward_summary.csv`
+- [ ] Parameters optimized — `python optimize.py` run, test/train ratio ≥ 75%
+- [ ] `USE_OPTIMIZED_PARAMS=true` set if using optimized params
+- [ ] Strategy variant chosen (`STRATEGY_VARIANT=`) and re-backtested
+- [ ] `DRY_RUN=false` only after ≥ 1 week of clean demo performance
+- [ ] `MAX_DAILY_LOSS_PCT` and `MAX_DRAWDOWN_PCT` set below prop-firm limits
 - [ ] `RISK_PER_TRADE` ≤ 0.5% until you trust the system
-- [ ] `MAGIC_NUMBER` unique on the account
-- [ ] `.env` in `.gitignore` (never commit credentials)
+- [ ] `MAGIC_NUMBER` unique on the account (no conflicts with manual trades)
+- [ ] `.env` in `.gitignore` — never committed credentials
 - [ ] Bot runs on a VPS, not your laptop
 - [ ] You can stop the bot remotely (systemd / pm2 / screen)
-- [ ] Telegram alerts confirmed working
+- [ ] Telegram/Discord alerts confirmed working on a test message
 
 ---
 

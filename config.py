@@ -161,6 +161,10 @@ class Settings:
         "WALKFORWARD_SUMMARY_CSV", "backtest_walkforward_summary.csv"
     ) or "backtest_walkforward_summary.csv"
 
+    # Parameter optimization
+    use_optimized_params: bool = _get_bool("USE_OPTIMIZED_PARAMS", False)
+    optimized_params_file: str = _get("OPTIMIZED_PARAMS_FILE", "optimized_params.json") or "optimized_params.json"
+
     def ensure_dirs(self) -> None:
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
         Path(self.journal_csv).parent.mkdir(parents=True, exist_ok=True)
@@ -168,3 +172,32 @@ class Settings:
 
 settings = Settings()
 settings.ensure_dirs()
+
+# Apply optimized parameters if USE_OPTIMIZED_PARAMS=true and the JSON file exists.
+# These override .env defaults for the live bot and all backtest/walk-forward runs.
+if settings.use_optimized_params:
+    import json as _json
+    _opt_path = Path(settings.optimized_params_file)
+    if _opt_path.exists():
+        try:
+            _opt_data = _json.loads(_opt_path.read_text(encoding="utf-8"))
+            _opt_params = _opt_data.get("params", {})
+            _applied: list = []
+            for _k, _v in _opt_params.items():
+                if hasattr(settings, _k):
+                    _orig = getattr(settings, _k)
+                    setattr(settings, _k, type(_orig)(_v))
+                    _applied.append(f"{_k}={_v}")
+            if _applied:
+                print(
+                    f"[config] Optimized params loaded from {_opt_path.name} "
+                    f"(optimized_at={_opt_data.get('optimized_at', '?')}): "
+                    + ", ".join(_applied)
+                )
+        except Exception as _e:
+            print(f"[config] WARNING: could not load {_opt_path}: {_e}")
+    else:
+        print(
+            f"[config] USE_OPTIMIZED_PARAMS=true but {_opt_path} not found — "
+            "run: python optimize.py"
+        )

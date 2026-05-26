@@ -1,0 +1,73 @@
+{
+  "optimized_at": "2026-05-25 14:47 UTC",
+  "symbols": [
+    "EURUSD",
+    "SPX500",
+    "US2000",
+    "NZDUSD"
+  ],
+  "timeframe": "M15",
+  "higher_timeframe": "H4",
+  "strategy_variant": "rsi_cross",
+  "trials_run": 300,
+  "history_bars": 50000,
+  "train_pct": 0.7,
+  "wfo_periods_train": 4,
+  "wfo_periods_test": 2,
+  "train_score": 2.0228,
+  "test_score": 1.0569,
+  "overfitting_ratio": 0.522,
+  "params": {
+    "ema_fast": 9,
+    "ema_slow": 78,
+    "adx_threshold": 23.0,
+    "sl_atr_mult": 1.75,
+    "tp_atr_mult": 4.75,
+    "atr_regime_percentile": 23,
+    "trailing_atr_mult": 1.12,
+    "breakeven_at_r": 1.62
+  },
+  "param_space": {
+    "ema_fast": {
+      "type": "int",
+      "low": 8,
+      "high": 30
+    },
+    "ema_slow": {
+      "type": "int",
+      "low": 30,
+      "high": 80
+    },
+    "adx_threshold": {
+      "type": "int",
+      "low": 15,
+      "high": 35
+    },
+    "sl_atr_mult": {
+      "type": "float",
+      "low": 0.8,
+      "high": 2.5
+    },
+    "tp_atr_mult": {
+      "type": "float",
+      "low": 1.5,
+      "high": 5.0
+    },
+    "atr_regime_percentile": {
+      "type": "int",
+      "low": 0,
+      "high": 30
+    },
+    "trailing_atr_mult": {
+      "type": "float",
+      "low": 0.5,
+      "high": 3.0
+    },
+    "breakeven_at_r": {
+      "type": "float",
+      "low": 0.3,
+      "high": 2.5
+    }
+  },
+  "usage": "Set USE_OPTIMIZED_PARAMS=true in .env to apply these params. They override .env defaults for the live bot and all backtest runs."
+}
