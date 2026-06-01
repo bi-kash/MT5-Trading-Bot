@@ -164,6 +164,7 @@ class Settings:
     # Parameter optimization
     use_optimized_params: bool = _get_bool("USE_OPTIMIZED_PARAMS", False)
     optimized_params_file: str = _get("OPTIMIZED_PARAMS_FILE", "optimized_params.json") or "optimized_params.json"
+    optimized_params_dir:  str = _get("OPTIMIZED_PARAMS_DIR",  "optimized_params")      or "optimized_params"
 
     def ensure_dirs(self) -> None:
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
@@ -201,3 +202,84 @@ if settings.use_optimized_params:
             f"[config] USE_OPTIMIZED_PARAMS=true but {_opt_path} not found — "
             "run: python optimize.py"
         )
+
+
+# ── Per-symbol parameter overrides ────────────────────────────────────────── #
+
+from contextlib import contextmanager as _contextmanager  # noqa: E402
+import json as _json_sym  # noqa: E402
+
+
+@_contextmanager
+def apply_symbol_params(symbol: str):
+    """Context manager: apply optimised params to ``settings`` for one symbol.
+
+    **Fallback chain** (when ``USE_OPTIMIZED_PARAMS=true``):
+
+    1. ``<OPTIMIZED_PARAMS_DIR>/<SYMBOL>.json``  — per-symbol file (highest priority)
+    2. ``<OPTIMIZED_PARAMS_FILE>``               — global fallback (single shared file)
+    3. ``.env`` defaults                         — no JSON files found (lowest priority)
+
+    The selected params are applied **temporarily**: on context exit, the original
+    ``settings`` values are restored atomically.  If ``USE_OPTIMIZED_PARAMS`` is
+    ``false`` the context is a no-op and ``settings`` is never touched.
+
+    Example usage (live bot, backtester, walk-forward)::
+
+        with apply_symbol_params("EURUSD"):
+            result = run_backtest(ltf, htf, inst=inst, ...)
+    """
+    if not settings.use_optimized_params:
+        yield
+        return
+
+    # ── Resolve which params to use (3-level fallback) ─────────────────── #
+    params_to_apply: dict = {}
+    source: str = "none"
+
+    # Priority 1: per-symbol JSON
+    sym_file = Path(settings.optimized_params_dir) / f"{symbol}.json"
+    if sym_file.exists():
+        try:
+            data = _json_sym.loads(sym_file.read_text(encoding="utf-8"))
+            _p   = data.get("params", {})
+            if _p:
+                params_to_apply = _p
+                source = f"{sym_file.name} (per-symbol)"
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Priority 2: global optimized_params_file (fallback)
+    if not params_to_apply:
+        global_file = Path(settings.optimized_params_file)
+        if global_file.exists():
+            try:
+                data = _json_sym.loads(global_file.read_text(encoding="utf-8"))
+                _p   = data.get("params", {})
+                if _p:
+                    params_to_apply = _p
+                    source = f"{global_file.name} (global fallback)"
+            except Exception:  # noqa: BLE001
+                pass
+
+    # Priority 3: no JSON found — yield without touching settings (.env defaults stay)
+    if not params_to_apply:
+        yield
+        return
+
+    # ── Apply, yield, restore ───────────────────────────────────────────── #
+    originals: dict = {}
+    for k, v in params_to_apply.items():
+        if hasattr(settings, k):
+            orig = getattr(settings, k)
+            try:
+                setattr(settings, k, type(orig)(v))
+                originals[k] = orig
+            except (TypeError, ValueError):
+                pass  # skip values that can't be coerced to the field's type
+
+    try:
+        yield
+    finally:
+        for k, v in originals.items():
+            setattr(settings, k, v)

@@ -66,10 +66,10 @@ WARMUP = 300  # bars reserved for indicator warm-up before each period
 # Format: name -> (type, low, high)
 PARAM_DEFS: Dict[str, Tuple[str, Any, Any]] = {
     "ema_fast":              ("int",   8,    30 ),
-    "ema_slow":              ("int",   30,   80 ),   # must stay > ema_fast (pruned if not)
+    "ema_slow":              ("int",   30,   60 ),   # must stay > ema_fast (pruned if not)
     "adx_threshold":         ("int",   15,   35 ),
     "sl_atr_mult":           ("float", 0.8,  2.5),
-    "tp_atr_mult":           ("float", 1.5,  5.0),
+    "tp_atr_mult":           ("float", 1.5,  3.5),
     "atr_regime_percentile": ("int",   0,    30 ),
     "trailing_atr_mult":     ("float", 0.5,  3.0),
     "breakeven_at_r":        ("float", 0.3,  2.5),
@@ -257,6 +257,156 @@ def _extract_best_params(study: optuna.Study) -> Dict[str, Any]:
     }
 
 
+# ── Single-symbol optimization (callable from optimize_all.py) ─────────── #
+
+def optimize_symbol(
+    symbol: str,
+    bars: int,
+    trials: int,
+    train_pct: float,
+    periods: int,
+    no_validate: bool,
+    equity: float,
+    connector,
+    cache,
+    output_path: Path,
+    *,
+    train_data: Optional[List] = None,
+    test_data:  Optional[List] = None,
+) -> Optional[Dict[str, Any]]:
+    """Optimize parameters for a single *symbol* and save the result to *output_path*.
+
+    The *connector* is used for data loading only and is **not** shut down by
+    this function — the caller owns the connector lifecycle.
+
+    Pre-loaded *train_data* / *test_data* can be supplied (e.g. when running in
+    parallel via ``optimize_all.py``) to skip the MT5 data-loading step entirely.
+
+    Returns the result ``dict`` on success, or ``None`` if no usable data was
+    found for the symbol.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    train_bars_approx = int(bars * train_pct)
+    test_bars_approx  = bars - train_bars_approx
+
+    if train_data is None:
+        print(f"  Loading data for {symbol} …", flush=True)
+        train_data, test_data = _load_symbol_data([symbol], bars, train_pct, connector, cache)
+
+    if not train_data:
+        print(f"  [SKIP {symbol}] No usable data — skipping")
+        return None
+
+    print(
+        f"  Data ready  ({train_bars_approx:,} train / {test_bars_approx:,} test bars). "
+        f"Starting {trials} trials…\n",
+        flush=True,
+    )
+
+    study = optuna.create_study(
+        direction="maximize",
+        study_name=f"opt_{symbol}",
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(),
+    )
+
+    completed = [0]
+
+    def _cb(st: optuna.Study, tr: optuna.Trial) -> None:  # noqa: ARG001
+        completed[0] += 1
+        n = completed[0]
+        if n % 25 == 0 or n == trials:
+            best   = st.best_value if st.best_value is not None else 0.0
+            best_t = st.best_trial.number if st.best_trial else "?"
+            print(
+                f"  [{symbol}] Trial {n:>4}/{trials}  "
+                f"best_score={best:.4f}  (trial #{best_t})",
+                flush=True,
+            )
+
+    study.optimize(
+        lambda t: _objective(t, train_data, periods, equity),
+        n_trials=trials,
+        callbacks=[_cb],
+    )
+
+    if study.best_trial is None:
+        print(f"  [FAIL {symbol}] No successful trials")
+        return None
+
+    best_params = _extract_best_params(study)
+    train_score = round(study.best_value, 4)
+
+    print(f"\n  [{symbol}] Best params  (train_score={train_score:.4f})")
+    for k, v in best_params.items():
+        orig = getattr(settings, k, "?")
+        tag  = "  ← changed" if str(orig) != str(v) else ""
+        print(f"    {k:<28} {str(v):<10}  (was {orig}){tag}")
+
+    # ── Out-of-sample validation ───────────────────────────────────────── #
+    test_score: Optional[float] = None
+    test_periods = max(2, periods // 2)
+
+    if not no_validate and test_data:
+        print(
+            f"\n  [{symbol}] Validating on held-out test slice "
+            f"({1 - train_pct:.0%}, {test_periods} periods)…"
+        )
+        with _temp_settings(**best_params):
+            ts_list = []
+            for ltf, htf, inst, spread_ticks in test_data:
+                s, trades = _score_slice(ltf, htf, inst, spread_ticks, test_periods, equity)
+                ts_list.append((s, trades))
+                log.info("[%s] test: score=%.4f trades=%d", inst.name, s, trades)
+        test_score = round(float(np.mean([s for s, _ in ts_list])), 4)
+        ratio = test_score / train_score if train_score > 0 else 0.0
+        print(
+            f"  [{symbol}] Train={train_score:.4f}  Test={test_score:.4f}  "
+            f"Ratio={ratio:.2%}  ",
+            end="",
+        )
+        if ratio >= 0.75:
+            print("✓  Robust")
+        elif ratio >= 0.50:
+            print("⚠  Moderate degradation — monitor live carefully")
+        else:
+            print("✗  Large drop — likely overfitting; try more --bars")
+
+    # ── Save JSON ─────────────────────────────────────────────────────── #
+    result: Dict[str, Any] = {
+        "optimized_at":      stamp,
+        "symbol":            symbol,
+        "timeframe":         settings.timeframe,
+        "higher_timeframe":  settings.higher_timeframe,
+        "strategy_variant":  settings.strategy_variant,
+        "trials_run":        trials,
+        "history_bars":      bars,
+        "train_pct":         train_pct,
+        "wfo_periods_train": periods,
+        "wfo_periods_test":  test_periods,
+        "train_score":       train_score,
+        "test_score":        test_score,
+        "overfitting_ratio": (
+            round(test_score / train_score, 3) if test_score and train_score else None
+        ),
+        "params": best_params,
+        "param_space": {
+            k: {"type": v[0], "low": v[1], "high": v[2]}
+            for k, v in PARAM_DEFS.items()
+        },
+        "usage": (
+            "Applied automatically when USE_OPTIMIZED_PARAMS=true in .env "
+            "and this file is in OPTIMIZED_PARAMS_DIR."
+        ),
+    }
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print(f"\n  [{symbol}] ✓  Saved → {output_path.resolve()}")
+
+    return result
+
+
 # ── Main ───────────────────────────────────────────────────────────────── #
 
 def main() -> None:
@@ -283,6 +433,13 @@ Examples:
                     help="Skip out-of-sample validation on test slice")
     ap.add_argument("--output", default=str(OUTPUT_FILE),
                     help=f"Output JSON file (default: {OUTPUT_FILE})")
+    ap.add_argument("--per-symbol", action="store_true",
+                    help="Optimize each symbol independently; saves to OUTPUT_DIR/SYMBOL.json")
+    ap.add_argument("--output-dir", default=settings.optimized_params_dir,
+                    help=(
+                        f"Directory for per-symbol JSON files (used with --per-symbol; "
+                        f"default: {settings.optimized_params_dir})"
+                    ))
     args = ap.parse_args()
 
     output_path = Path(args.output)
@@ -319,6 +476,52 @@ Examples:
     print(f"  Output    : {output_path.resolve()}")
     print(f"  Cache     : {'on (' + settings.cache_dir + ')' if cache else 'off'}")
     print()
+
+    # ── Per-symbol mode: each symbol optimised independently ───────────── #
+    if args.per_symbol:
+        out_dir = Path(args.output_dir)
+        all_results: List[Dict[str, Any]] = []
+        for idx, sym in enumerate(symbols, 1):
+            print(f"\n{'=' * 60}")
+            print(f"  [{idx}/{len(symbols)}] {sym}")
+            print(f"{'=' * 60}")
+            res = optimize_symbol(
+                symbol=sym,
+                bars=args.bars,
+                trials=args.trials,
+                train_pct=args.train_pct,
+                periods=args.periods,
+                no_validate=args.no_validate,
+                equity=equity,
+                connector=connector,
+                cache=cache,
+                output_path=out_dir / f"{sym}.json",
+            )
+            if res:
+                all_results.append(res)
+        connector.shutdown()
+        if all_results:
+            print(f"\n\n{'=' * 72}")
+            print(f"  PER-SYMBOL SUMMARY  ({len(all_results)} completed)")
+            print(f"{'=' * 72}")
+            print(f"  {'Symbol':<12} {'Train':>7} {'Test':>7} {'Ratio':>8}  "
+                  f"{'ef':>4} {'es':>4} {'adx':>4} {'sl':>5} {'tp':>5}")
+            _div = "─" * 62
+            print(f"  {_div}")
+            for r in all_results:
+                p  = r["params"]
+                ov = r.get("overfitting_ratio")
+                rs = f"{ov:.2%}" if ov is not None else "  N/A  "
+                print(
+                    f"  {r['symbol']:<12} {r['train_score']:>7.4f} "
+                    f"{(r.get('test_score') or 0.0):>7.4f} {rs:>8}  "
+                    f"{p['ema_fast']:>4} {p['ema_slow']:>4} "
+                    f"{p['adx_threshold']:>4.0f} {p['sl_atr_mult']:>5.2f} "
+                    f"{p['tp_atr_mult']:>5.2f}"
+                )
+            print(f"\n  Saved to : {out_dir.resolve()}/")
+            print(f"  To use   : set USE_OPTIMIZED_PARAMS=true in .env")
+        return
 
     print("Loading historical data...", flush=True)
     train_data, test_data = _load_symbol_data(symbols, args.bars, args.train_pct, connector, cache)

@@ -21,7 +21,7 @@ from typing import Dict, Optional
 
 import MetaTrader5 as mt5
 
-from config import settings
+from config import apply_symbol_params, settings
 from journal import record as journal_record
 from logger import get_logger
 from ml_filter import MLFilter
@@ -150,7 +150,8 @@ class TradingBot:
     def _maybe_open_new_trades(self) -> None:
         all_positions = self.mt5.positions_for_magic()
         for symbol in settings.symbols:
-            self._evaluate_symbol(symbol, all_positions)
+            with apply_symbol_params(symbol):
+                self._evaluate_symbol(symbol, all_positions)
 
     def _throttled_log(self, key: str, interval_minutes: int = 30) -> bool:
         """Return True and update timestamp if enough time has passed since last log for key."""
@@ -342,7 +343,8 @@ class TradingBot:
             return
         for pos in self.mt5.positions_for_magic():
             self._known_tickets.add(pos.ticket)
-            self._trail_position(pos)
+            with apply_symbol_params(pos.symbol):
+                self._trail_position(pos)
 
     def _trail_position(self, pos) -> None:
         info = self.mt5.symbol_info(pos.symbol)

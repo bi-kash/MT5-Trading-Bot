@@ -32,7 +32,7 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
-from config import settings
+from config import apply_symbol_params, settings
 from indicators import adx, atr, ema, rsi
 from logger import get_logger
 
@@ -589,7 +589,8 @@ def _backtest_symbol(symbol: str, bars: int, equity: float, connector, cache=Non
     if len(ltf) < settings.backtest_min_bars:
         return {"symbol": symbol, "_error": f"only {len(ltf)} bars (need {settings.backtest_min_bars})"}
 
-    result = run_backtest(ltf, htf, inst=inst, starting_equity=equity, spread_ticks=spread_ticks)
+    with apply_symbol_params(symbol):
+        result = run_backtest(ltf, htf, inst=inst, starting_equity=equity, spread_ticks=spread_ticks)
     s = result.summary(equity)
     s["symbol"] = symbol
     s["category"] = _categorise(inst.path)

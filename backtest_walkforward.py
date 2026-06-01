@@ -46,7 +46,7 @@ from backtest import (
     load_mt5,
     run_backtest,
 )
-from config import settings
+from config import apply_symbol_params, settings
 from logger import get_logger
 
 log = get_logger("walkforward")
@@ -111,8 +111,9 @@ def walkforward_symbol(symbol: str, equity: float, n_periods: int,
         if len(htf_slice) < 250:
             continue
 
-        bt = run_backtest(ltf_slice, htf_slice, inst=inst,
-                          starting_equity=equity, spread_ticks=spread_ticks)
+        with apply_symbol_params(symbol):
+            bt = run_backtest(ltf_slice, htf_slice, inst=inst,
+                              starting_equity=equity, spread_ticks=spread_ticks)
         summary = bt.summary(equity)
         summary["symbol"] = symbol
         summary["category"] = _categorise(inst.path)
