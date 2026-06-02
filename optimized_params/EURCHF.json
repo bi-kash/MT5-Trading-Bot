@@ -1,0 +1,68 @@
+{
+  "optimized_at": "2026-06-01 13:38 UTC",
+  "symbol": "EURCHF",
+  "timeframe": "M15",
+  "higher_timeframe": "H4",
+  "strategy_variant": "rsi_cross",
+  "trials_run": 300,
+  "history_bars": 50000,
+  "train_pct": 0.7,
+  "wfo_periods_train": 4,
+  "wfo_periods_test": 2,
+  "train_score": 2.06,
+  "test_score": 0.0,
+  "overfitting_ratio": null,
+  "params": {
+    "ema_fast": 26,
+    "ema_slow": 32,
+    "adx_threshold": 31.0,
+    "sl_atr_mult": 0.81,
+    "tp_atr_mult": 1.62,
+    "atr_regime_percentile": 16,
+    "trailing_atr_mult": 2.57,
+    "breakeven_at_r": 1.98
+  },
+  "param_space": {
+    "ema_fast": {
+      "type": "int",
+      "low": 8,
+      "high": 30
+    },
+    "ema_slow": {
+      "type": "int",
+      "low": 30,
+      "high": 60
+    },
+    "adx_threshold": {
+      "type": "int",
+      "low": 15,
+      "high": 35
+    },
+    "sl_atr_mult": {
+      "type": "float",
+      "low": 0.8,
+      "high": 2.5
+    },
+    "tp_atr_mult": {
+      "type": "float",
+      "low": 1.5,
+      "high": 3.5
+    },
+    "atr_regime_percentile": {
+      "type": "int",
+      "low": 0,
+      "high": 30
+    },
+    "trailing_atr_mult": {
+      "type": "float",
+      "low": 0.5,
+      "high": 3.0
+    },
+    "breakeven_at_r": {
+      "type": "float",
+      "low": 0.3,
+      "high": 2.5
+    }
+  },
+  "usage": "Applied automatically when USE_OPTIMIZED_PARAMS=true in .env and this file is in OPTIMIZED_PARAMS_DIR."
+}

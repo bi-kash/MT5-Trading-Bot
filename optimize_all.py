@@ -153,7 +153,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python optimize_all.py                                # all SYMBOLS, 4 workers
+  python optimize_all.py                                # all cached symbols, 4 workers
   python optimize_all.py --symbols EURUSD,NZDUSD        # subset
   python optimize_all.py --bars 100000 --trials 300     # more thorough
   python optimize_all.py --workers 8                    # 8 parallel workers
@@ -162,7 +162,7 @@ Examples:
 """,
     )
     ap.add_argument("--symbols",
-                    help="Comma-separated symbols (default: all SYMBOLS from .env)")
+                    help="Comma-separated symbols (default: all cached symbols, or SYMBOLS from .env)")
     ap.add_argument("--trials",  type=int, default=300,
                     help="Optuna trials per symbol (default: 300)")
     ap.add_argument("--bars",    type=int, default=50_000,
@@ -175,7 +175,7 @@ Examples:
                     help="Skip out-of-sample validation (faster)")
     ap.add_argument("--output-dir", default=settings.optimized_params_dir,
                     help=f"Output directory (default: {settings.optimized_params_dir})")
-    ap.add_argument("--workers", type=int, default=4,
+    ap.add_argument("--workers", type=int, default=16,
                     help="Parallel workers for optimization, 1\u201315 (default: 4)")
     ap.add_argument("--skip-existing", action="store_true", default=False,
                     help="Skip symbols already having a JSON in OUTPUT_DIR (resume mode)")
@@ -186,12 +186,25 @@ Examples:
     out_dir.mkdir(parents=True, exist_ok=True)
     equity    = settings.backtest_equity
 
-    symbols: List[str] = (
-        [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-        if args.symbols else list(settings.symbols)
-    )
+    if args.symbols:
+        symbols: List[str] = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    else:
+        symbols = []
+        cache_dir = Path(settings.cache_dir)
+        if cache_dir.exists():
+            for pkl in cache_dir.glob("*_M1.pkl"):
+                sym = pkl.name.replace("_M1.pkl", "")
+                symbols.append(sym)
+        
+        symbols = sorted(list(set(symbols)))
+        if symbols:
+            print(f"Auto-detected {len(symbols)} symbols from {cache_dir.name}/")
+        else:
+            print("No cached data found. Defaulting to SYMBOLS from .env.")
+            symbols = list(settings.symbols)
+
     if not symbols:
-        print("No symbols configured. Set SYMBOLS in .env or pass --symbols.")
+        print("No symbols found. Populate data_cache or pass --symbols.")
         sys.exit(1)
 
     # Resume mode: skip already-finished symbols
